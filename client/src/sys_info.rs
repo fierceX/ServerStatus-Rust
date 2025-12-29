@@ -79,7 +79,7 @@ pub fn start_net_speed_collect_t(args: &Args) {
 
     thread::spawn(move || loop {
         // 必须先刷新数据
-        networks.refresh(true);
+        networks.refresh();
 
         let (mut net_rx, mut net_tx) = (0_u64, 0_u64);
         for (name, data) in &networks {
@@ -167,7 +167,7 @@ impl Monitor {
 
         // 2. 磁盘处理
         // 仅刷新数值，不重新扫描挂载点
-        self.disks.refresh(true);
+        self.disks.refresh();
 
         let mut hdd_total = 0_u64;
         let mut hdd_avail = 0_u64;
@@ -244,7 +244,7 @@ impl Monitor {
                 stat.last_network_out = network_out - m_network_out;
             }
         } else {
-            self.networks.refresh(true);
+            self.networks.refresh();
             let (mut network_in, mut network_out) = (0_u64, 0_u64);
             for (name, data) in &self.networks {
                 if args.skip_iface(name) { continue; }

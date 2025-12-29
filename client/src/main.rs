@@ -438,6 +438,7 @@ async fn main() -> Result<()> {
         // 并在其内部循环中添加 Monitor::new() 逻辑，类似于 http_report
         let result = { grpc::report(&args, &mut stat_base).await };
         dbg!(&result);
+        eprintln!("aaa");
     } else {
         eprint!("invalid addr scheme!");
     }

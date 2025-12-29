@@ -10,6 +10,8 @@ use url::Url;
 use stat_common::server_status::server_status_client::ServerStatusClient;
 use stat_common::server_status::StatRequest;
 
+// 确保引入 sys_info 模块
+use crate::sys_info;
 use crate::sample_all;
 use crate::Args;
 
@@ -62,8 +64,15 @@ pub async fn report(args: &Args, stat_base: &mut StatRequest) -> anyhow::Result<
         Ok(req)
     });
 
+    // === 核心优化: 初始化 Monitor 上下文 ===
+    // 只创建一次 System/Disks/Networks 对象
+    let mut monitor = sys_info::Monitor::new(); 
+
     loop {
-        let stat_rt = sample_all(args, stat_base);
+        // === 核心优化: 传入 monitor 引用进行复用 ===
+        // 假设 sample_all 已经改为: fn sample_all(..., monitor: &mut sys_info::Monitor)
+        let stat_rt = sample_all(args, stat_base, &mut monitor);
+        
         let mut client = grpc_client.clone();
 
         tokio::spawn(async move {
