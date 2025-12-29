@@ -1,16 +1,18 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Local};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::str;
+use std::time::{Duration, Instant};
 
 use crate::Args;
 
+// 保持原有的数据结构不变
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Date {
     pub year: i32,
     pub month: u32,
-    #[serde(default = "Default::default")]
+    #[serde(default)]
     pub day: u32,
 }
 
@@ -30,35 +32,23 @@ pub struct DateRT {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Traffic {
-    // pub id: u64,
     pub total: RT,
-    // v1 months
-    #[serde(default = "Default::default")]
+    #[serde(default)]
     pub months: Vec<DateRT>,
-    // v1 day
-    #[serde(default = "Default::default")]
+    #[serde(default)]
     pub days: Vec<DateRT>,
-    // v2 month
-    #[serde(default = "Default::default")]
+    #[serde(default)]
     pub month: Vec<DateRT>,
-    // v2 day
-    #[serde(default = "Default::default")]
+    #[serde(default)]
     pub day: Vec<DateRT>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Iface {
-    // v1
-    #[serde(default = "Default::default")]
-    pub r#id: String,
-    #[serde(default = "Default::default")]
-    pub nick: String,
-    // v2
-    #[serde(default = "Default::default")]
-    pub name: String,
-    #[serde(default = "Default::default")]
-    pub alias: String,
-    // common
+    #[serde(default)]
+    pub r#id: String, // v1 uses id
+    #[serde(default)]
+    pub name: String, // v2 uses name
     pub traffic: Traffic,
 }
 
@@ -66,26 +56,109 @@ pub struct Iface {
 pub struct VnstatJson {
     pub vnstatversion: String,
     pub jsonversion: String,
-    #[serde(default = "Default::default")]
+    #[serde(default)]
     pub interfaces: Vec<Iface>,
 }
 
-fn calc_traffic(j: VnstatJson, mr: bool, args: &Args) -> Result<(u64, u64, u64, u64)> {
-    let mut v1 = false;
-    if j.jsonversion.eq("1") {
-        v1 = true;
-    } else if !j.jsonversion.eq("2") {
-        panic!("vnstat version number must be 1 or 2");
+// ============================
+// 优化部分：VnstatMonitor
+// ============================
+
+pub struct VnstatMonitor {
+    // 缓存 (total_rx, total_tx, month_rx, month_tx)
+    cache: (u64, u64, u64, u64),
+    last_update: Instant,
+    update_interval: Duration,
+}
+
+impl VnstatMonitor {
+    pub fn new() -> Self {
+        Self {
+            cache: (0, 0, 0, 0),
+            // 初始化为过去的时间，确保第一次调用必定刷新
+            last_update: Instant::now().checked_sub(Duration::from_secs(3600)).unwrap(),
+            // 建议缓存时间：30秒或60秒。vnstat 数据库更新没那么快，每秒查询纯属浪费
+            update_interval: Duration::from_secs(60), 
+        }
+    }
+
+    /// 获取流量数据。
+    /// 自动处理缓存：如果距离上次成功获取未超过 interval，直接返回缓存。
+    pub fn get_traffic(&mut self, args: &Args) -> Result<(u64, u64, u64, u64)> {
+        // 1. 检查缓存是否过期
+        if self.last_update.elapsed() < self.update_interval {
+            return Ok(self.cache);
+        }
+
+        // 2. 尝试执行命令并更新
+        // 如果失败，打印日志但不崩溃，返回旧的缓存值（如果是第一次失败则返回0）
+        match self.fetch_from_cmd(args) {
+            Ok(res) => {
+                self.cache = res;
+                self.last_update = Instant::now();
+                Ok(res)
+            }
+            Err(e) => {
+                error!("vnstat update failed: {:?}, using cache", e);
+                // 失败时也更新时间戳，避免下一秒立即重试导致连续 fork 失败阻塞 CPU
+                // 设置一个较短的重试间隔（例如 10秒）
+                self.last_update = Instant::now() - self.update_interval + Duration::from_secs(10);
+                Ok(self.cache)
+            }
+        }
+    }
+
+    fn fetch_from_cmd(&self, args: &Args) -> Result<(u64, u64, u64, u64)> {
+        let output = if args.vnstat_mr == 1 {
+            Command::new("vnstat")
+                .args(["--json", "m"]) // 仅月度模式
+                .output()
+                .context("failed to execute vnstat")?
+        } else if args.vnstat_mr > 1 && args.vnstat_mr <= 28 {
+            Command::new("vnstat")
+                .args(["--json", "d", "32"]) // 天模式，获取足够的历史天数以供计算
+                .output()
+                .context("failed to execute vnstat")?
+        } else {
+            // 参数错误不应该 Panic，而是返回错误
+            anyhow::bail!("invalid vnstat month rotate => `{}`", args.vnstat_mr);
+        };
+
+        if !output.status.success() {
+            anyhow::bail!("vnstat exited with non-zero status: {:?}", output.status);
+        }
+
+        let json_str = str::from_utf8(&output.stdout).context("vnstat output is not valid utf8")?;
+        
+        let j: VnstatJson = serde_json::from_str(json_str)
+            .map_err(|e| {
+                // 打印出错的 JSON 片段以便调试，防止 panic
+                let snippet = if json_str.len() > 100 { &json_str[..100] } else { json_str };
+                anyhow::anyhow!("invalid vnstat json: {}, content: {}...", e, snippet)
+            })?;
+
+        calc_traffic(j, args.vnstat_mr > 1, args)
+    }
+}
+
+// 逻辑优化：移除了 unnecessary panic，优化了日期比较
+fn calc_traffic(j: VnstatJson, use_mr: bool, args: &Args) -> Result<(u64, u64, u64, u64)> {
+    let v1 = j.jsonversion == "1";
+    if !v1 && j.jsonversion != "2" {
+        anyhow::bail!("unsupported vnstat json version: {}", j.jsonversion);
     }
 
     let local_now = Local::now();
     let cur_year = local_now.year();
     let cur_month = local_now.month();
     let cur_day = local_now.day();
+    
     let (mut network_in, mut network_out, mut m_network_in, mut m_network_out) = (0, 0, 0, 0);
 
-    for iface in j.interfaces.iter() {
+    for iface in j.interfaces {
         let name = if v1 { &iface.r#id } else { &iface.name };
+        
+        // 过滤
         if args.skip_iface(name) {
             continue;
         }
@@ -93,55 +166,66 @@ fn calc_traffic(j: VnstatJson, mr: bool, args: &Args) -> Result<(u64, u64, u64, 
         network_in += iface.traffic.total.rx;
         network_out += iface.traffic.total.tx;
 
-        if mr {
-            // month rotate, v2 only
+        if use_mr {
+            // Month Rotate (自定义结算日)
             if v1 {
-                panic!("The parameter --json d 31 is not supported in v1.15");
-            } else if cur_day >= args.vnstat_mr {
-                for d in iface.traffic.day.iter() {
-                    if d.date.year == cur_year && d.date.month == cur_month && d.date.day >= args.vnstat_mr {
-                        m_network_in += d.rx;
-                        m_network_out += d.tx;
-                    }
-                }
+                // 如果是 v1 但又指定了 mr，虽然 CLI 层面可能防住了，这里还是防守一下
+                continue; 
+            }
+            
+            // 优化：计算出目标结算周期的【起始日期】
+            // 如果当前日期 >= 结算日，则周期为 [本月结算日, 下月结算日) -> 只需统计本月且 day >= mr
+            // 如果当前日期 < 结算日， 则周期为 [上月结算日, 本月结算日) -> 统计上月 day >= mr 和 本月 day < mr
+            
+            let is_current_month_cycle = cur_day >= args.vnstat_mr;
+            
+            let (target_year, target_month) = if is_current_month_cycle {
+                (cur_year, cur_month)
             } else {
-                let mut pre_year = cur_year;
-                let mut pre_month = cur_month - 1;
-                if pre_month == 0 {
-                    pre_month = 12;
-                    pre_year -= 1;
-                }
+                 // 上个月
+                 if cur_month == 1 { (cur_year - 1, 12) } else { (cur_year, cur_month - 1) }
+            };
 
-                for d in iface.traffic.day.iter() {
-                    if d.date.year == pre_year && d.date.month == pre_month && d.date.day >= args.vnstat_mr {
+            for d in &iface.traffic.day {
+                let d_year = d.date.year;
+                let d_month = d.date.month;
+                let d_day = d.date.day;
+
+                if is_current_month_cycle {
+                    // 情况1: 已经过了结算日，统计【本月】且【日期 >= 结算日】
+                    if d_year == cur_year && d_month == cur_month && d_day >= args.vnstat_mr {
                         m_network_in += d.rx;
                         m_network_out += d.tx;
                     }
-                    if d.date.year == cur_year && d.date.month == cur_month && d.date.day < args.vnstat_mr {
+                } else {
+                    // 情况2: 还没到结算日，统计【上月 >= 结算日】 和 【本月 < 结算日】
+                    if d_year == target_year && d_month == target_month && d_day >= args.vnstat_mr {
+                        // 上月部分
+                        m_network_in += d.rx;
+                        m_network_out += d.tx;
+                    } else if d_year == cur_year && d_month == cur_month && d_day < args.vnstat_mr {
+                        // 本月部分
                         m_network_in += d.rx;
                         m_network_out += d.tx;
                     }
                 }
             }
         } else {
-            // normal
-            let month = if v1 {
-                &iface.traffic.months
-            } else {
-                &iface.traffic.month
-            };
-
-            for m in month.iter() {
-                if cur_year != m.date.year || cur_month != m.date.month {
-                    continue;
+            // 标准月度 (Normal)
+            let months = if v1 { &iface.traffic.months } else { &iface.traffic.month };
+            
+            // 优化：直接查找当前月份，不用遍历所有历史月份
+            for m in months {
+                if m.date.year == cur_year && m.date.month == cur_month {
+                    m_network_in += m.rx;
+                    m_network_out += m.tx;
+                    break; // 找到当前月即可跳出内层循环
                 }
-                m_network_in += m.rx;
-                m_network_out += m.tx;
             }
         }
     }
 
-    let factor: u64 = if v1 { 1024 } else { 1 };
+    let factor = if v1 { 1024 } else { 1 };
     Ok((
         network_in * factor,
         network_out * factor,
@@ -149,39 +233,6 @@ fn calc_traffic(j: VnstatJson, mr: bool, args: &Args) -> Result<(u64, u64, u64, 
         m_network_out * factor,
     ))
 }
-
-pub fn get_traffic(args: &Args) -> Result<(u64, u64, u64, u64)> {
-    if args.vnstat_mr == 1 {
-        // !
-        let a = Command::new("vnstat")
-            .args(["--json", "m"])
-            .output()
-            .expect("failed to execute vnstat")
-            .stdout;
-        let b = str::from_utf8(&a)?;
-        let j: VnstatJson = serde_json::from_str(b).unwrap_or_else(|e| {
-            error!("{:?}", e);
-            panic!("invalid vnstat json `{b}")
-        });
-        calc_traffic(j, false, args)
-    } else if args.vnstat_mr > 1 && args.vnstat_mr <= 28 {
-        // month rotate
-        let a = Command::new("vnstat")
-            .args(["--json", "d", "32"])
-            .output()
-            .expect("failed to execute vnstat")
-            .stdout;
-        let b = str::from_utf8(&a)?;
-        let j: VnstatJson = serde_json::from_str(b).unwrap_or_else(|e| {
-            error!("{:?}", e);
-            panic!("invalid vnstat json `{b}")
-        });
-        calc_traffic(j, true, args)
-    } else {
-        panic!("invalid vnstat month rotate => `{}", args.vnstat_mr);
-    }
-}
-
 #[allow(unused)]
 #[cfg(test)]
 mod tests {

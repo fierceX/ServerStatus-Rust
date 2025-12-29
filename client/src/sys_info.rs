@@ -12,7 +12,8 @@ use sysinfo::{
     CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System,
 };
 
-use crate::vnstat;
+// use crate::vnstat;
+use crate::vnstat::VnstatMonitor;
 use crate::Args;
 use stat_common::{
     server_status::{DiskInfo, StatRequest, SysInfo},
@@ -115,6 +116,7 @@ pub struct Monitor {
     sys: System,
     disks: Disks,
     networks: Networks,
+    vnstat_mon: VnstatMonitor, 
     // ZFS 缓存
     zfs_cache: Vec<DiskInfo>,
     zfs_tick: u8,
@@ -130,6 +132,7 @@ impl Monitor {
             ),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
+            vnstat_mon: VnstatMonitor::new(),
             zfs_cache: vec![],
             zfs_tick: 0,
         }
@@ -237,7 +240,7 @@ impl Monitor {
 
         // 4. 网络流量总计
         if args.vnstat {
-            if let Ok((network_in, network_out, m_network_in, m_network_out)) = vnstat::get_traffic(args) {
+            if let Ok((network_in, network_out, m_network_in, m_network_out)) = self.vnstat_mon.get_traffic(args) {
                 stat.network_in = network_in;
                 stat.network_out = network_out;
                 stat.last_network_in = network_in - m_network_in;
