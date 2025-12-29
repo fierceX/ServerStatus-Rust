@@ -18,10 +18,11 @@ use std::thread::sleep;
 use stat_common::server_status::{IpInfo, StatRequest, SysInfo};
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, GenericError>;
+
 mod geoip;
 mod grpc;
 mod status;
-mod sys_info;
+mod sys_info; // 这里对应上一条回答中的 monitor.rs 代码
 mod vnstat;
 
 static CU: &str = "cu.tz.cloudcpp.com:80";
@@ -36,7 +37,6 @@ pub struct ClientConfig {
 
 pub static G_CONFIG: Lazy<Mutex<ClientConfig>> = Lazy::new(|| Mutex::new(ClientConfig::default()));
 
-// https://docs.rs/clap/latest/clap/_derive/index.html#command-attributes
 #[derive(Parser, Debug, Clone)]
 #[command(author, version = env!("APP_VERSION"), about, long_about = None)]
 pub struct Args {
@@ -190,14 +190,12 @@ impl Args {
     }
 }
 
-fn sample_all(args: &Args, stat_base: &StatRequest) -> StatRequest {
-    // dbg!(&stat_base);
+// 优化：传入 monitor 上下文进行复用
+fn sample_all(args: &Args, stat_base: &StatRequest, monitor: &mut sys_info::Monitor) -> StatRequest {
     let mut stat_rt = stat_base.clone();
-
-    #[cfg(all(feature = "native", not(feature = "sysinfo"), target_os = "linux"))]
-    status::sample(args, &mut stat_rt);
-    #[cfg(all(feature = "sysinfo", not(feature = "native")))]
-    sys_info::sample(args, &mut stat_rt);
+    
+    // 复用 monitor 进行采集
+    monitor.sample(args, &mut stat_rt);
 
     stat_rt.latest_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
@@ -225,16 +223,16 @@ fn http_report(args: &Args, stat_base: &mut StatRequest) -> Result<()> {
         }
     }
     let mut retries = 0;
-    let max_retries = 10; // Indicates a maximum of 1024s delay = 17 minutes
+    let max_retries = 10; 
     let tcp_addr = loop {
         match domain.to_socket_addrs() {
             Ok(mut addrs) => break addrs.next().unwrap(),
             Err(e) => {
                 if retries >= max_retries {
-                    return Err(Box::new(e)); // Return the error if retries are exhausted
+                    return Err(Box::new(e)); 
                 }
                 retries += 1;
-                let delay = Duration::from_secs(2u64.pow(retries)); // Exponential backoff
+                let delay = Duration::from_secs(2u64.pow(retries));
                 eprintln!("Name resolution failed, retrying in {:?}...", delay);
                 sleep(delay);
             }
@@ -263,8 +261,15 @@ fn http_report(args: &Args, stat_base: &mut StatRequest) -> Result<()> {
     }
 
     let http_client = http_client_builder.build()?;
+    
+    // === 核心优化点 ===
+    // 在循环外初始化 Monitor 上下文，只创建一次 System/Disks 对象
+    let mut monitor = sys_info::Monitor::new(); 
+    // ================
+
     loop {
-        let stat_rt = sample_all(args, stat_base);
+        // 传入 monitor 实例
+        let stat_rt = sample_all(args, stat_base, &mut monitor);
 
         let body_data: Option<Vec<u8>>;
         let mut content_type = "application/octet-stream";
@@ -276,10 +281,7 @@ fn http_report(args: &Args, stat_base: &mut StatRequest) -> Result<()> {
         } else {
             let buf = stat_rt.encode_to_vec();
             body_data = Some(buf);
-            // content_type = "application/octet-stream";
         }
-        // byte 581, json str 1281
-        // dbg!(&body_data.as_ref().unwrap().len());
 
         let client = http_client.clone();
         let url = args.addr.to_string();
@@ -376,23 +378,16 @@ async fn main() -> Result<()> {
         o.sys_info = Some(sys_info);
     }
 
-    // use native
-    #[cfg(all(feature = "native", not(feature = "sysinfo"), target_os = "linux"))]
-    {
-        eprintln!("feature native enabled");
-        status::start_cpu_percent_collect_t();
-        status::start_net_speed_collect_t(&args);
-    }
+    // 统一启用优化版的后台收集线程
+    eprintln!("feature sysinfo enabled (Optimized)");
+    sys_info::start_cpu_percent_collect_t();
+    sys_info::start_net_speed_collect_t(&args);
 
-    // use sysinfo
-    #[cfg(all(feature = "sysinfo", not(feature = "native")))]
-    {
-        eprintln!("feature sysinfo enabled");
-        sys_info::start_cpu_percent_collect_t();
-        sys_info::start_net_speed_collect_t(&args);
-    }
-
+    // 假设 status 模块依然负责 ping 的后台线程管理
+    // 如果你已经把 ping 逻辑也移到了 sys_info，请改为 sys_info::start_all_ping_collect_t
     status::start_all_ping_collect_t(&args);
+    
+    // 依然使用 status 模块检测网络连通性 (TCP Connect)
     let (ipv4, ipv6) = status::get_network(&args);
     eprintln!("get_network (ipv4, ipv6) => ({ipv4}, {ipv6})");
 
@@ -439,6 +434,8 @@ async fn main() -> Result<()> {
         let result = http_report(&args, &mut stat_base);
         dbg!(&result);
     } else if args.addr.starts_with("grpc") {
+        // 注意：如果你也需要优化 gRPC 模式，需要进入 grpc::report 
+        // 并在其内部循环中添加 Monitor::new() 逻辑，类似于 http_report
         let result = { grpc::report(&args, &mut stat_base).await };
         dbg!(&result);
     } else {
