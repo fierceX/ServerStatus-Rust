@@ -153,7 +153,7 @@ fn calc_traffic(j: VnstatJson, mr: bool, args: &Args) -> Result<(u64, u64, u64, 
 pub fn get_traffic(args: &Args) -> Result<(u64, u64, u64, u64)> {
     if args.vnstat_mr == 1 {
         // !
-        let a = Command::new("/usr/bin/vnstat")
+        let a = Command::new("vnstat")
             .args(["--json", "m"])
             .output()
             .expect("failed to execute vnstat")
@@ -166,7 +166,7 @@ pub fn get_traffic(args: &Args) -> Result<(u64, u64, u64, u64)> {
         calc_traffic(j, false, args)
     } else if args.vnstat_mr > 1 && args.vnstat_mr <= 28 {
         // month rotate
-        let a = Command::new("/usr/bin/vnstat")
+        let a = Command::new("vnstat")
             .args(["--json", "d", "32"])
             .output()
             .expect("failed to execute vnstat")
