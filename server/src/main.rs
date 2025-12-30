@@ -58,7 +58,7 @@ fn create_app_router() -> Router {
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
         .allow_origin(Any);
-
+    
     Router::new()
         .route("/report", post(http::report))
         .route("/json/stats.json", get(http::get_stats_json))

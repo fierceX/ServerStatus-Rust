@@ -204,6 +204,36 @@ impl StatsMgr {
                         // 3. Update State & Notify
                         if let Ok(mut host_stat_map) = stat_map.lock() {
                             let mut need_notify = false;
+                            // 定义缓存变量
+                            let mut cached_ip_info = None;
+                            let mut cached_sys_info = None;
+
+                            // 检查是否存在上一条记录
+                            if let Some(pre_stat) = host_stat_map.get(&stat_t.name) {
+                                // 【新增】如果当前包没有 ip_info，使用上一条的缓存
+                                if stat_t.ip_info.is_none() {
+                                    cached_ip_info = pre_stat.ip_info.clone();
+                                }
+                                
+                                // 【新增】如果当前包没有 sys_info (包含 version)，使用上一条的缓存
+                                if stat_t.sys_info.is_none() {
+                                    cached_sys_info = pre_stat.sys_info.clone();
+                                }
+
+                                // 掉线重连通知检查
+                                if stat_t.notify && (pre_stat.latest_ts + cfg.offline_threshold < stat_t.latest_ts) {
+                                    need_notify = true;
+                                }
+                            }
+
+                            // 【新增】回填缓存数据到当前状态
+                            if let Some(ip_info) = cached_ip_info {
+                                stat_t.ip_info = Some(ip_info);
+                            }
+                            if let Some(sys_info) = cached_sys_info {
+                                stat_t.sys_info = Some(sys_info);
+                            }
+
                             let mut ip_info_to_copy = None;
                             
                             if let Some(pre_stat) = host_stat_map.get(&stat_t.name) {

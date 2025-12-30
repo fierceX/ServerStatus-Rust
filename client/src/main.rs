@@ -173,6 +173,12 @@ pub struct Args {
     proxy: String,
     #[arg(long, env = "SSR_NO_PROXY", default_value = "", help = "no proxy, eg: ip-api.com")]
     no_proxy: String,
+    #[arg(
+        long = "lite", 
+        env = "SSR_LITE", 
+        help = "enable lite mode to save bandwidth (send static info only once per minute), default:false"
+    )]
+    lite: bool
 }
 
 impl Args {
@@ -191,7 +197,7 @@ impl Args {
 }
 
 // 优化：传入 monitor 上下文进行复用
-fn sample_all(args: &Args, stat_base: &StatRequest, monitor: &mut sys_info::Monitor) -> StatRequest {
+fn sample_all(args: &Args, stat_base: &StatRequest, monitor: &mut sys_info::Monitor,is_full_report: bool) -> StatRequest {
     let mut stat_rt = stat_base.clone();
     
     // 复用 monitor 进行采集
@@ -199,16 +205,39 @@ fn sample_all(args: &Args, stat_base: &StatRequest, monitor: &mut sys_info::Moni
 
     stat_rt.latest_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-    if !args.disable_extra {
-        if let Ok(o) = G_CONFIG.lock() {
-            if let Some(ip_info) = o.ip_info.as_ref() {
-                stat_rt.ip_info = Some(ip_info.clone());
-            }
-            if let Some(sys_info) = o.sys_info.as_ref() {
-                stat_rt.sys_info = Some(sys_info.clone());
+    if is_full_report {
+        // 全量包：附带 heavy 的静态信息
+        if !args.disable_extra {
+            if let Ok(o) = G_CONFIG.lock() {
+                if let Some(ip_info) = o.ip_info.as_ref() {
+                    stat_rt.ip_info = Some(ip_info.clone());
+                }
+                if let Some(sys_info) = o.sys_info.as_ref() {
+                    stat_rt.sys_info = Some(sys_info.clone());
+                }
             }
         }
+    } else {
+        // 精简包：主动清理不需要每秒发送的字段
+        // 注意：这取决于服务端是否支持（通常服务端收到空值会保持原值或忽略）
+        
+        stat_rt.version.clear(); // 版本号字符串
+        // stat_rt.location.clear(); // 如果服务端支持缓存 location，也可以清理
+        
+        // 甚至可以清理磁盘的挂载点名称，只传 usage，但这风险较大，
+        // 建议先只清理 sys_info 和 ip_info 这两个最大的头。
     }
+
+    // if !args.disable_extra {
+    //     if let Ok(o) = G_CONFIG.lock() {
+    //         if let Some(ip_info) = o.ip_info.as_ref() {
+    //             stat_rt.ip_info = Some(ip_info.clone());
+    //         }
+    //         if let Some(sys_info) = o.sys_info.as_ref() {
+    //             stat_rt.sys_info = Some(sys_info.clone());
+    //         }
+    //     }
+    // }
 
     stat_rt
 }
@@ -267,9 +296,14 @@ fn http_report(args: &Args, stat_base: &mut StatRequest) -> Result<()> {
     let mut monitor = sys_info::Monitor::new(); 
     // ================
 
+    let mut report_count: u64 = 0;
+
     loop {
         // 传入 monitor 实例
-        let stat_rt = sample_all(args, stat_base, &mut monitor);
+        
+        let is_full_report = !args.lite || (report_count % 60 == 0);
+        report_count = report_count.wrapping_add(1);
+        let stat_rt = sample_all(args, stat_base, &mut monitor, is_full_report);
 
         let body_data: Option<Vec<u8>>;
         let mut content_type = "application/octet-stream";
@@ -438,7 +472,6 @@ async fn main() -> Result<()> {
         // 并在其内部循环中添加 Monitor::new() 逻辑，类似于 http_report
         let result = { grpc::report(&args, &mut stat_base).await };
         dbg!(&result);
-        eprintln!("aaa");
     } else {
         eprint!("invalid addr scheme!");
     }
