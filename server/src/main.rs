@@ -11,12 +11,10 @@ use once_cell::sync::OnceCell;
 use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::thread;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 use tokio::signal;
-// 添加导入
 use tokio::runtime::Builder;
 use tokio::time;
 
@@ -63,12 +61,10 @@ fn create_app_router() -> Router {
 
     Router::new()
         .route("/report", post(http::report))
-        .route("/json/stats.json", get(http::get_stats_json)) // 兼容就旧主题
-        .route("/json/history.json", get(http::get_history_stats)) // 兼容就旧主题
-        // .route("/config.pub.json", get(http::get_site_config_json)) // TODO
+        .route("/json/stats.json", get(http::get_stats_json))
+        .route("/json/history.json", get(http::get_history_stats))
         .route("/api/admin/authorize", post(jwt::authorize))
-        .route("/api/admin/:path", get(http::admin_api)) // stats.json || config.json
-        // .route("/admin", get(assets::admin_index_handler))
+        .route("/api/admin/:path", get(http::admin_api))
         .route("/detail", get(http::get_detail))
         .route("/map", get(http::get_map))
         .route("/i", get(http::init_client))
@@ -80,7 +76,6 @@ fn create_app_router() -> Router {
 async fn fallback(uri: Uri) -> impl IntoResponse {
     assets::static_handler(uri).await
 }
-
 pub async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
@@ -102,10 +97,25 @@ pub async fn shutdown_signal() {
         _ = terminate => {},
     }
 
-    println!("signal received, starting graceful shutdown");
+    eprintln!("🛑 Signal received, starting graceful shutdown...");
+    eprintln!("⏳ Waiting for existing connections to close... (Press Ctrl+C again to force exit)");
+
+    // 1. 启动看门狗线程（3秒后强杀）
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        eprintln!("💀 Shutdown timed out (3s), forcing exit!");
+        std::process::exit(1);
+    });
+
+    // 2. 监听第二次 Ctrl+C，实现立即强杀
+    tokio::spawn(async {
+        signal::ctrl_c().await.ok();
+        eprintln!("💀 Forced exit by user!");
+        std::process::exit(1);
+    });
 }
 
-// 在 main 函数中初始化专用线程池
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     pretty_env_logger::init();
@@ -123,8 +133,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // config load
     if let Some(cfg) = if args.cloud {
-        // export SRV_CONF=$(cat config.toml)
-        // echo "$SRV_CONF"
         eprintln!("✨ run in cloud mode, load config from env");
         config::from_env()
     } else {
@@ -145,6 +153,7 @@ async fn main() -> Result<(), anyhow::Error> {
     *notifier::NOTIFIER_HANDLE.lock().unwrap() = Some(Handle::current());
     let cfg = G_CONFIG.get().unwrap();
     let notifies: Arc<Mutex<Vec<Box<dyn notifier::Notifier + Send>>>> = Arc::new(Mutex::new(Vec::new()));
+    
     if cfg.tgbot.enabled {
         let o = Box::new(notifier::tgbot::TGBot::new(&cfg.tgbot));
         notifies.lock().unwrap().push(o);
@@ -165,7 +174,6 @@ async fn main() -> Result<(), anyhow::Error> {
         let o = Box::new(notifier::webhook::Webhook::new(&cfg.webhook));
         notifies.lock().unwrap().push(o);
     }
-    // init notifier end
 
     // notify test
     if args.notify_test {
@@ -173,7 +181,7 @@ async fn main() -> Result<(), anyhow::Error> {
             eprintln!("send test message to {}", notifier.kind());
             notifier.notify_test().unwrap();
         }
-        thread::sleep(Duration::from_millis(7000)); // TODO: wait
+        time::sleep(Duration::from_millis(7000)).await;
         eprintln!("Please check for notifications");
         process::exit(0);
     }
@@ -187,11 +195,42 @@ async fn main() -> Result<(), anyhow::Error> {
     }
     let db = Arc::new(db::Database::new("stats.db")?);
 
+    // // 修复：使用 spawn_blocking 包裹阻塞的数据库任务，避免卡死 Async Runtime
+    // let db_clone = db.clone();
+    // tokio::spawn(async move {
+    //     let mut interval = time::interval(Duration::from_secs(300));
+    //     loop {
+    //         interval.tick().await;
+    //         let db = db_clone.clone();
+    //         // 放到 blocking 线程池运行
+    //         let _ = tokio::task::spawn_blocking(move || {
+    //             if let Err(e) = db.run_scheduled_aggregation() {
+    //                 eprintln!("Error running data aggregation: {}", e);
+    //             }
+    //         }).await;
+    //     }
+    // });
+
+    // let db_clone2 = db.clone();
+    // tokio::spawn(async move {
+    //     let mut interval = time::interval(Duration::from_secs(24 * 60 * 60));
+    //     loop {
+    //         interval.tick().await;
+    //         let db = db_clone2.clone();
+    //         // 放到 blocking 线程池运行
+    //         let _ = tokio::task::spawn_blocking(move || {
+    //             if let Err(e) = db.optimize() {
+    //                 eprintln!("Error running data optimize: {}", e);
+    //             }
+    //         }).await;
+    //     }
+    // });
     let db_clone = db.clone();
-    tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(300)); // 每5分钟执行一次
+    std::thread::spawn(move || {
+        // 手动实现简单的 loop + sleep
         loop {
-            interval.tick().await;
+            // 每5分钟 (300秒)
+            std::thread::sleep(Duration::from_secs(300));
             if let Err(e) = db_clone.run_scheduled_aggregation() {
                 eprintln!("Error running data aggregation: {}", e);
             }
@@ -199,10 +238,10 @@ async fn main() -> Result<(), anyhow::Error> {
     });
 
     let db_clone2 = db.clone();
-    tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(24*60*60)); // 每天执行一次
+    std::thread::spawn(move || {
         loop {
-            interval.tick().await;
+            // 每天 (86400秒)
+            std::thread::sleep(Duration::from_secs(24 * 60 * 60));
             if let Err(e) = db_clone2.optimize() {
                 eprintln!("Error running data optimize: {}", e);
             }
@@ -212,30 +251,21 @@ async fn main() -> Result<(), anyhow::Error> {
     // serv grpc
     tokio::spawn(async move { grpc::serv_grpc(cfg).await });
 
-    let http_addr = cfg.http_addr.to_string();
-    eprintln!("🚀 listening on http://{http_addr}");
-
     // 创建专用于处理历史数据的线程池
     let history_runtime = Builder::new_multi_thread()
-        .worker_threads(4)  // 可以根据需要调整线程数
+        .worker_threads(4)
         .thread_name("history-worker")
         .enable_all()
         .build()
         .unwrap();
     
-    // 将线程池存储在全局变量中
     if crate::http::init_history_runtime(history_runtime).is_err() {
         error!("can't set history runtime");
         process::exit(1);
     }
 
-    // 注意：这里有重复的代码，需要删除下面的重复部分
-    // serv grpc
-    // tokio::spawn(async move { grpc::serv_grpc(cfg).await });
-    
-    // let http_addr = cfg.http_addr.to_string();
-    // eprintln!("🚀 listening on http://{http_addr}");
-    // 重复代码结束
+    let http_addr = cfg.http_addr.to_string();
+    eprintln!("🚀 listening on http://{http_addr}");
 
     let listener = TcpListener::bind(&http_addr).await.unwrap();
     axum::serve(listener, create_app_router())
