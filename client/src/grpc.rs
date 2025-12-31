@@ -1,12 +1,15 @@
 // #![allow(unused)]
 use std::str::FromStr;
-use std::thread;
+// use std::thread;
 use std::time::Duration;
 use tokio::net::lookup_host;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tonic::{metadata::MetadataValue, Request};
-use tower::timeout::Timeout;
+// use tower::timeout::Timeout;
 use url::Url;
+// use prost::Message;
 
 use stat_common::server_status::server_status_client::ServerStatusClient;
 use stat_common::server_status::StatRequest;
@@ -76,12 +79,10 @@ pub async fn report(args: &Args, stat_base: &mut StatRequest) -> anyhow::Result<
         }
     }
 
-    let timeout_channel = Timeout::new(channel, Duration::from_millis(3000));
-    let grpc_client = ServerStatusClient::with_interceptor(timeout_channel, move |mut req: Request<()>| {
+    let grpc_client = ServerStatusClient::with_interceptor(channel, move |mut req: Request<()>| {
         req.metadata_mut().insert("authorization", token.clone());
         req.metadata_mut()
             .insert("ssr-auth", MetadataValue::try_from(ssr_auth).unwrap());
-
         Ok(req)
     });
 
@@ -91,28 +92,61 @@ pub async fn report(args: &Args, stat_base: &mut StatRequest) -> anyhow::Result<
 
     let mut report_count: u64 = 0;
 
+
     loop {
-        // === 核心优化: 传入 monitor 引用进行复用 ===
-        // 假设 sample_all 已经改为: fn sample_all(..., monitor: &mut sys_info::Monitor)
-        let is_full_report = !args.lite || (report_count % 60 == 0);
-        report_count = report_count.wrapping_add(1);
-        let stat_rt = sample_all(args, stat_base, &mut monitor,is_full_report);
+        info!("Establishing gRPC stream connection...");
+
+        // 1. 创建一个 MPSC 通道 (缓冲区大小 10 即可)
+        let (tx, rx) = mpsc::channel(10);
         
+        // 2. 将 Receiver 包装成 gRPC 认可的 Stream
+        let request_stream = ReceiverStream::new(rx);
+
+        // 3. 克隆 client 并发起请求
         let mut client = grpc_client.clone();
+        
+        // 异步发起流式请求
+        // 注意：这里只是建立了连接，只要我们持有 tx，就可以一直发
+        // let response_future = client.report(request_stream);
 
+        // 4. 启动一个后台任务来等待服务端的最终响应 (或错误)
+        // 当流断开时，这个任务会结束
         tokio::spawn(async move {
-            let request = tonic::Request::new(stat_rt);
-
-            match client.report(request).await {
-                Ok(resp) => {
-                    info!("grpc report resp => {:?}", resp);
-                }
-                Err(status) => {
-                    error!("grpc report status => {:?}", status);
-                }
+            // 注意：这里可能需要包一层 Request::new，取决于 tonic 版本和生成的代码
+            // 如果报错类型不匹配，请尝试: client.report(Request::new(request_stream)).await
+            match client.report(request_stream).await {
+                Ok(resp) => info!("Stream closed by server: {:?}", resp),
+                Err(e) => error!("Stream error: {:?}", e),
             }
         });
 
-        thread::sleep(Duration::from_secs(args.report_interval));
+        // === 内层循环：负责每秒采集并发送数据 ===
+        loop {
+            // 逻辑与之前相同：判断是否全量包
+            let is_full_report = !args.lite || (report_count % 60 == 0);
+            report_count = report_count.wrapping_add(1);
+
+            // 采集数据
+            let stat_rt = sample_all(args, stat_base, &mut monitor, is_full_report);
+
+            // 发送数据到流中
+            // 如果 send 返回 Err，说明接收端关闭了（连接断了），我们需要跳出内层循环进行重连
+            if tx.send(stat_rt).await.is_err() {
+                error!("gRPC stream disconnected, reconnecting...");
+                break; // 跳出内层循环 -> 触发外层循环 -> 重建流
+            }
+
+            // 成功发送
+            if args.debug {
+                debug!("Report sent (stream), full: {}", is_full_report);
+            }
+
+            // 等待间隔
+            // 建议：如果使用流式，这里可以用 tokio::time::sleep 替代 thread::sleep 以便更好地让出 CPU
+            tokio::time::sleep(Duration::from_secs(args.report_interval)).await;
+        }
+
+        // 避免疯狂重试，断线后稍作等待
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }

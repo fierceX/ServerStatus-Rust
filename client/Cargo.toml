@@ -47,6 +47,7 @@ tonic = {version = "0.11", features = ["tls", "tls-webpki-roots", "gzip"]}
 tower = { version = "0.4" }
 webpki-roots = "0.26"
 url = "2.5.0"
+tokio-stream = "0.1.17"
 
 [features]
 default = ["sysinfo"]

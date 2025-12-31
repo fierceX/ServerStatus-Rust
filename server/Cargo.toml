@@ -55,6 +55,8 @@ tower-http = { version = "0.5", features = ["cors", "add-extension"] }
 url = "2.5.0"
 uuid = {version = "1.7", default-features = false, features = ["serde", "v4"]}
 rusqlite = { version = "0.28.0", features = ["bundled"] }
+futures = "0.3.31"
+tokio-stream = "0.1.17"
 
 [package.metadata.deb]
 maintainer = "zdz <doge.py@gmail.com>"

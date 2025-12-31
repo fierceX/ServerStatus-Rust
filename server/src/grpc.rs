@@ -1,14 +1,16 @@
 use anyhow::Result;
-use std::str::FromStr;
+use std::{str::FromStr};
 use tonic::{
     transport::{Certificate, Identity, Server, ServerTlsConfig},
-    Request, Response, Status,
+    Request, Response, Status,Streaming,
 };
 
 use stat_common::server_status;
 use stat_common::server_status::server_status_server::{ServerStatus, ServerStatusServer};
 use stat_common::server_status::StatRequest;
-
+// use futures::Stream; // 引入 Stream trait
+use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::mpsc; // 引入异步通道
 use crate::config::Config;
 use crate::G_CONFIG;
 use crate::G_STATS_MGR;
@@ -16,37 +18,77 @@ use crate::G_STATS_MGR;
 #[derive(Default)]
 pub struct ServerStatusSrv {}
 
+// type ResponseStream = Pin<Box<dyn Stream<Item = Result<server_status::Response, Status>> + Send>>;
+type ResponseStream = ReceiverStream<Result<server_status::Response, Status>>;
+
 #[tonic::async_trait]
 impl ServerStatus for ServerStatusSrv {
-    async fn report(&self, request: Request<StatRequest>) -> Result<Response<server_status::Response>, Status> {
-        // 优化 1: 将可能阻塞的操作放到 blocking 线程池
-        // 如果直接在 async fn 中调用 mgr.report (如果是同步send)，当队列满时会卡死 gRPC 线程
-        let req_data = request.into_inner();
-        
-        tokio::task::spawn_blocking(move || {
-            if let Some(mgr) = G_STATS_MGR.get() {
-                // 这里的序列化和 channel 发送都是同步/CPU密集型操作，
-                // 放到 spawn_blocking 里最安全
-                match serde_json::to_value(req_data) {
-                    Ok(v) => {
-                        // 即使队列满了阻塞，也只会阻塞这个 blocking 线程，不会卡死 gRPC 服务
-                        if let Err(e) = mgr.report(v) {
-                             error!("mgr report failed: {:?}", e);
+    type ReportStream = ResponseStream;
+    async fn report(&self, request: Request<Streaming<StatRequest>>) -> Result<Response<ResponseStream>, Status> {
+        // 1. 获取输入流
+        let mut in_stream = request.into_inner();
+
+        // 2. 创建输出流的通道 (用于给客户端回传 ACK)
+        // 缓冲区设为 16 即可，通常只需要偶尔回复，或者是每收到一条回复一条
+        let (tx, rx) = mpsc::channel(16);
+
+        // 3. 启动一个异步任务来处理这个连接的流数据
+        tokio::spawn(async move {
+            // 循环读取流中的每一条消息
+            while let Ok(Some(stat)) = in_stream.message().await {
+                
+                // 将数据处理逻辑放入 blocking 线程，防止卡死 gRPC 所在的 Async Runtime
+                // 因为 StatsMgr 内部用了同步锁和同步 channel
+                let process_result = tokio::task::spawn_blocking(move || {
+                    if let Some(mgr) = G_STATS_MGR.get() {
+                        // 序列化为 Value
+                        match serde_json::to_value(stat) {
+                            Ok(v) => {
+                                // 提交给 StatsMgr
+                                if let Err(e) = mgr.report(v) {
+                                    error!("mgr report failed: {:?}", e);
+                                    return false; // 失败
+                                }
+                                return true; // 成功
+                            }
+                            Err(err) => {
+                                error!("serde_json error: {:?}", err);
+                            }
                         }
                     }
-                    Err(err) => {
-                        error!("serde_json::to_value err => {:?}", err);
+                    false
+                }).await;
+
+                // 根据处理结果决定是否回复 (可选)
+                // 在流式传输中，通常不需要每条都回复，可以累积回复，或者只回复错误
+                // 这里为了演示，假设我们每收到一条都回复一个简单的 OK
+                match process_result {
+                    Ok(_) => {
+                        // 构建回复消息
+                        let resp = server_status::Response {
+                            code: 0,
+                            message: "ok".to_string(),
+                        };
+                        
+                        // 发送回复给客户端
+                        // 如果发送失败(客户端断开)，退出循环
+                        if tx.send(Ok(resp)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Spawn blocking join error: {}", e);
+                        break;
                     }
                 }
             }
-        }); 
-        // 注意：spawn_blocking 是异步的，这里不等待结果直接返回 OK，提高吞吐量
-        // 探针上报通常允许偶尔的丢失，不需要严格等待落库结果
+            
+            // 流结束或出错，连接断开
+            debug!("Client disconnected");
+        });
 
-        Ok(Response::new(server_status::Response {
-            code: 0,
-            message: "ok".to_string(),
-        }))
+        // 4. 立即返回响应流的 Receiver，握手完成
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 

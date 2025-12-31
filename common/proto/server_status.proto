@@ -119,4 +119,4 @@ message Response {
   string message = 2;
 }
 
-service ServerStatus { rpc Report(StatRequest) returns (Response); }
+service ServerStatus { rpc Report(stream StatRequest) returns (stream Response); }
